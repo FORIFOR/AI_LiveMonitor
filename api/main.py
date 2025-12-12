@@ -3,6 +3,7 @@ import json
 import os
 import time
 import threading
+import logging
 from collections import deque
 from itertools import islice
 from typing import Deque, Optional
@@ -13,6 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Realtime Assistant API")
 
@@ -85,6 +90,8 @@ def run_stt_sync(state: SessionState, lang: str):
     """Run STT in a separate thread (synchronous gRPC)."""
     from google.cloud import speech
     
+    logger.info(f"Starting STT thread with lang={lang}")
+    
     def put_result(result: dict):
         """Thread-safe way to put result into asyncio queue."""
         if state._loop and state.running:
@@ -94,6 +101,7 @@ def run_stt_sync(state: SessionState, lang: str):
     
     try:
         client = get_speech_client()
+        logger.info("Speech client initialized")
         
         # Build config for streaming recognition
         config = speech.RecognitionConfig(
@@ -109,6 +117,7 @@ def run_stt_sync(state: SessionState, lang: str):
         )
         
         requests = stt_request_generator(state)
+        logger.info("Starting streaming_recognize...")
         responses = client.streaming_recognize(
             config=streaming_config,
             requests=requests,
@@ -122,10 +131,13 @@ def run_stt_sync(state: SessionState, lang: str):
                 if not text:
                     continue
                 if result.is_final:
+                    logger.info(f"STT final: {text[:50]}...")
                     put_result({"type": "stt.final", "text": text})
                 else:
                     put_result({"type": "stt.partial", "text": text})
+        logger.info("STT streaming completed")
     except Exception as e:
+        logger.error(f"STT error: {str(e)}", exc_info=True)
         put_result({"type": "error", "message": f"STT error: {str(e)}"})
 
 
@@ -164,6 +176,8 @@ async def run_advice(ws: WebSocket, state: SessionState):
     """Run Gemini advice generation loop."""
     from google.genai import types as genai_types
     
+    logger.info("Advice generation loop started")
+    
     while state.running:
         await asyncio.sleep(1.0)
 
@@ -176,6 +190,7 @@ async def run_advice(ws: WebSocket, state: SessionState):
         state.last_advice_at = now
 
         prompt = build_advice_prompt(state)
+        logger.info(f"Generating advice with {len(state.recent_text)} transcript lines")
 
         try:
             client = get_genai_client()
@@ -194,7 +209,9 @@ async def run_advice(ws: WebSocket, state: SessionState):
                 if delta:
                     await ws.send_json({"type": "advice.delta", "text": delta})
             await ws.send_json({"type": "advice.final", "text": ""})
+            logger.info("Advice generation completed")
         except Exception as e:
+            logger.error(f"Advice error: {str(e)}", exc_info=True)
             await ws.send_json({"type": "error", "message": f"Advice error: {str(e)}"})
 
 
@@ -206,11 +223,13 @@ async def health():
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    logger.info("WebSocket connection accepted")
     state = SessionState()
     state._loop = asyncio.get_running_loop()
     
     stt_processor_task = None
     advice_task = None
+    audio_chunk_count = 0
 
     try:
         while True:
@@ -218,6 +237,11 @@ async def ws_endpoint(ws: WebSocket):
 
             # Binary = audio chunk
             if "bytes" in msg and msg["bytes"] is not None:
+                audio_chunk_count += 1
+                if audio_chunk_count == 1:
+                    logger.info(f"First audio chunk received, size={len(msg['bytes'])} bytes")
+                elif audio_chunk_count % 100 == 0:
+                    logger.info(f"Audio chunks received: {audio_chunk_count}, queue size: {state.audio_q.qsize()}")
                 try:
                     state.audio_q.put_nowait(msg["bytes"])
                 except Full:
@@ -229,9 +253,11 @@ async def ws_endpoint(ws: WebSocket):
                 try:
                     data = json.loads(msg["text"])
                 except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse JSON: {msg['text'][:100]}")
                     continue
                     
                 t = data.get("type")
+                logger.info(f"Received message type: {t}")
 
                 if t == "auth":
                     # Firebase auth verification (optional for MVP)
@@ -241,6 +267,7 @@ async def ws_endpoint(ws: WebSocket):
 
                 if t == "start":
                     lang = data.get("lang", "ja-JP")
+                    logger.info(f"Starting session with lang={lang}")
                     
                     # Start STT in a separate thread
                     state.stt_thread = threading.Thread(
@@ -257,8 +284,10 @@ async def ws_endpoint(ws: WebSocket):
                     advice_task = asyncio.create_task(run_advice(ws, state))
                     
                     await ws.send_json({"type": "started"})
+                    logger.info("Session started, STT thread and advice task running")
 
                 if t == "stop":
+                    logger.info("Stop requested")
                     state.running = False
                     state.audio_q.put(None)  # Signal to stop STT
                     break
