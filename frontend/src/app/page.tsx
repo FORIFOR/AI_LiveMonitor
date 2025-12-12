@@ -9,7 +9,10 @@ type Msg =
   | { type: "advice.final"; text: string }
   | { type: "error"; message: string }
   | { type: "started" }
-  | { type: "auth.ok" };
+  | { type: "auth.ok" }
+  | { type: "tts.start" }
+  | { type: "tts.complete"; format: string; sample_rate: number; channels: number; sample_width: number }
+  | { type: "tts.error"; message: string };
 
 interface TranscriptLine {
   id: string;
@@ -26,13 +29,63 @@ export default function Page() {
   const [finalLines, setFinalLines] = useState<TranscriptLine[]>([]);
   const [adviceChunks, setAdviceChunks] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [ttsPlaying, setTtsPlaying] = useState(false);
+  const [ttsEnabled, setTtsEnabled] = useState(true);
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const ttsAudioCtxRef = useRef<AudioContext | null>(null);
+  const pendingTtsDataRef = useRef<ArrayBuffer | null>(null);
 
   const wsUrl = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000/ws";
+
+  // Play TTS audio from PCM data
+  const playTtsAudio = useCallback(async (audioData: ArrayBuffer | null, sampleRate: number) => {
+    if (!audioData || !ttsEnabled) {
+      setTtsPlaying(false);
+      return;
+    }
+
+    try {
+      // Create or reuse audio context for TTS playback
+      if (!ttsAudioCtxRef.current || ttsAudioCtxRef.current.state === "closed") {
+        ttsAudioCtxRef.current = new AudioContext({ sampleRate });
+      }
+      const ctx = ttsAudioCtxRef.current;
+
+      // Resume context if suspended (browser autoplay policy)
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+
+      // Convert PCM Int16 to Float32 for Web Audio API
+      const int16Array = new Int16Array(audioData);
+      const float32Array = new Float32Array(int16Array.length);
+      for (let i = 0; i < int16Array.length; i++) {
+        float32Array[i] = int16Array[i] / 32768.0;
+      }
+
+      // Create audio buffer and play
+      const audioBuffer = ctx.createBuffer(1, float32Array.length, sampleRate);
+      audioBuffer.getChannelData(0).set(float32Array);
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(ctx.destination);
+      
+      source.onended = () => {
+        setTtsPlaying(false);
+      };
+      
+      source.start();
+      console.log("TTS audio playback started");
+    } catch (e) {
+      console.error("Failed to play TTS audio:", e);
+      setTtsPlaying(false);
+    }
+  }, [ttsEnabled]);
 
   const connect = useCallback(async () => {
     setError(null);
@@ -46,6 +99,13 @@ export default function Page() {
     };
 
     ws.onmessage = (ev) => {
+      // Handle binary data (TTS audio)
+      if (ev.data instanceof ArrayBuffer) {
+        console.log("Received TTS audio data:", ev.data.byteLength, "bytes");
+        pendingTtsDataRef.current = ev.data;
+        return;
+      }
+      
       try {
         const msg = JSON.parse(ev.data) as Msg;
         if (msg.type === "stt.partial") setPartial(msg.text);
@@ -65,6 +125,19 @@ export default function Page() {
         }
         if (msg.type === "started") {
           console.log("Session started");
+        }
+        if (msg.type === "tts.start") {
+          console.log("TTS generation started");
+          setTtsPlaying(true);
+        }
+        if (msg.type === "tts.complete") {
+          console.log("TTS complete, playing audio");
+          playTtsAudio(pendingTtsDataRef.current, msg.sample_rate);
+          pendingTtsDataRef.current = null;
+        }
+        if (msg.type === "tts.error") {
+          console.error("TTS error:", msg.message);
+          setTtsPlaying(false);
         }
       } catch (e) {
         console.error("Failed to parse message:", e);
@@ -198,6 +271,19 @@ export default function Page() {
           >
             Clear
           </button>
+          <button
+            onClick={() => setTtsEnabled(!ttsEnabled)}
+            className={`px-4 py-2 rounded-lg font-medium transition-all flex items-center gap-2 ${
+              ttsEnabled
+                ? "bg-purple-600 hover:bg-purple-700 text-white"
+                : "bg-gray-200 hover:bg-gray-300 text-gray-700"
+            }`}
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+            </svg>
+            TTS {ttsEnabled ? "ON" : "OFF"}
+          </button>
           <div className="flex items-center gap-2 ml-auto">
             <div
               className={`w-3 h-3 rounded-full ${
@@ -210,6 +296,14 @@ export default function Page() {
             {running && (
               <span className="ml-2 text-sm text-red-500 animate-pulse">
                 Recording...
+              </span>
+            )}
+            {ttsPlaying && (
+              <span className="ml-2 text-sm text-purple-500 animate-pulse flex items-center gap-1">
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                </svg>
+                Speaking...
               </span>
             )}
           </div>
@@ -270,7 +364,7 @@ export default function Page() {
 
         <footer className="mt-8 text-center text-sm text-gray-500 dark:text-gray-400">
           <p>
-            Powered by Google Cloud Speech-to-Text and Vertex AI Gemini
+            Powered by Google Cloud Speech-to-Text, Vertex AI Gemini, and Gemini 2.5 TTS
           </p>
         </footer>
       </div>

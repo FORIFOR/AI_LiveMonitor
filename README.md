@@ -189,17 +189,24 @@ Google の最新 LLM サービス。会議アドバイス生成に使用。
 - **エンドポイント**: `{location}-aiplatform.googleapis.com`
 - **機能**: ストリーミング生成 (streamGenerateContent)
 
-#### 3. Cloud Run
+#### 3. Gemini 2.5 TTS (Text-to-Speech)
+AIアドバイスを音声で読み上げる機能。
+- **モデル**: `gemini-2.5-flash-preview-tts`
+- **出力形式**: PCM 24kHz, 16-bit, モノラル
+- **ボイス**: Kore (日本語対応)
+- **機能**: テキストから自然な音声を生成
+
+#### 4. Cloud Run
 サーバーレスコンテナ実行環境。バックエンドAPIをホスト。
 - **特徴**: 自動スケーリング、従量課金、WebSocket対応
 - **コンテナランタイム**: Docker
 
-#### 4. Cloud Build
+#### 5. Cloud Build
 CI/CD パイプライン。GitHubからの自動ビルド。
 - **トリガー**: GitHub push イベント
 - **ビルダー**: `gcr.io/cloud-builders/docker`
 
-#### 5. Google Container Registry (GCR)
+#### 6. Google Container Registry (GCR)
 Dockerイメージの保存・管理。
 - **形式**: `gcr.io/{project-id}/{image-name}:{tag}`
 
@@ -243,6 +250,10 @@ process(inputs) {
 - `{ type: "stt.final", text: "..." }` - 確定文字起こし結果
 - `{ type: "advice.delta", text: "..." }` - AIアドバイス (ストリーミング)
 - `{ type: "advice.final" }` - AIアドバイス完了
+- `{ type: "tts.start" }` - TTS音声生成開始
+- `ArrayBuffer` (Binary) - TTS音声データ (PCM 24kHz Int16)
+- `{ type: "tts.complete", format: "pcm", sample_rate: 24000 }` - TTS音声生成完了
+- `{ type: "tts.error", message: "..." }` - TTSエラー
 - `{ type: "error", message: "..." }` - エラー通知
 
 ### 4. バックエンド処理
@@ -318,6 +329,10 @@ stream = client.models.generate_content_stream(
 | `GCP_PROJECT` | GCPプロジェクトID | `ailivemonitor` |
 | `GCP_LOCATION` | Vertex AIリージョン | `asia-northeast1` |
 | `GEMINI_MODEL` | 使用するGeminiモデル | `gemini-2.0-flash` |
+| `TTS_MODEL` | TTSモデル | `gemini-2.5-flash-preview-tts` |
+| `TTS_VOICE` | TTSボイス名 | `Kore` |
+| `TTS_ENABLED` | TTS機能の有効/無効 | `true` |
+| `GOOGLE_AI_API_KEY` | Google AI API キー (TTS用、オプション) | `AIza...` |
 | `GOOGLE_APPLICATION_CREDENTIALS` | サービスアカウントキーのパス | `/app/credentials.json` |
 
 ### 必要なGCP API

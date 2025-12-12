@@ -34,10 +34,14 @@ app.add_middleware(
 GENAI_PROJECT = os.getenv("GCP_PROJECT", "")
 GENAI_LOCATION = os.getenv("GCP_LOCATION", "asia-northeast1")
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+TTS_MODEL_NAME = os.getenv("TTS_MODEL", "gemini-2.5-flash-preview-tts")
+TTS_VOICE_NAME = os.getenv("TTS_VOICE", "Kore")  # Japanese-friendly voice
+TTS_ENABLED = os.getenv("TTS_ENABLED", "true").lower() == "true"
 
 # Lazy initialization of clients
 _speech_client = None
 _genai_client = None
+_tts_client = None
 
 
 def get_speech_client():
@@ -58,6 +62,60 @@ def get_genai_client():
             location=GENAI_LOCATION
         )
     return _genai_client
+
+
+def get_tts_client():
+    """Get TTS client (uses Google AI API, not Vertex AI for TTS preview)."""
+    global _tts_client
+    if _tts_client is None:
+        from google import genai
+        # TTS preview models require Google AI API (not Vertex AI)
+        api_key = os.getenv("GOOGLE_AI_API_KEY", "")
+        if api_key:
+            _tts_client = genai.Client(api_key=api_key)
+        else:
+            # Fall back to Vertex AI client
+            _tts_client = get_genai_client()
+    return _tts_client
+
+
+async def generate_tts_audio(text: str) -> bytes:
+    """Generate TTS audio from text using Gemini 2.5 TTS."""
+    from google.genai import types as genai_types
+    
+    if not text.strip():
+        return b""
+    
+    try:
+        client = get_tts_client()
+        
+        response = client.models.generate_content(
+            model=TTS_MODEL_NAME,
+            contents=text,
+            config=genai_types.GenerateContentConfig(
+                response_modalities=["AUDIO"],
+                speech_config=genai_types.SpeechConfig(
+                    voice_config=genai_types.VoiceConfig(
+                        prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                            voice_name=TTS_VOICE_NAME,
+                        )
+                    )
+                ),
+            ),
+        )
+        
+        # Extract audio data from response
+        if (response.candidates and 
+            response.candidates[0].content and 
+            response.candidates[0].content.parts):
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    return part.inline_data.data
+        
+        return b""
+    except Exception as e:
+        logger.error(f"TTS generation error: {str(e)}", exc_info=True)
+        return b""
 
 
 class SessionState:
@@ -158,6 +216,37 @@ async def process_stt_results(ws: WebSocket, state: SessionState):
             break
 
 
+def extract_first_sentence(text: str) -> str:
+    """Extract the first meaningful sentence from advice text for TTS."""
+    import re
+    
+    # Clean up the text
+    text = text.strip()
+    
+    # Skip headers and bullet points, find the first actual sentence
+    lines = text.split('\n')
+    for line in lines:
+        line = line.strip()
+        # Skip empty lines, headers (starting with #), and bullet points
+        if not line or line.startswith('#') or line.startswith('-') or line.startswith('*'):
+            continue
+        # Skip lines that are just labels like "次に言う1文:"
+        if line.endswith(':') or line.endswith('：'):
+            continue
+        
+        # Find the first sentence (ending with 。, !, ?, or .)
+        match = re.search(r'^(.+?[。！？!?.])', line)
+        if match:
+            return match.group(1)
+        
+        # If no sentence ending found, return the whole line if it's reasonable length
+        if len(line) > 10 and len(line) < 200:
+            return line
+    
+    # Fallback: return first 100 chars
+    return text[:100] if len(text) > 100 else text
+
+
 def build_advice_prompt(state: SessionState) -> str:
     """Build prompt for Gemini advice generation."""
     recent_list = list(state.recent_text)
@@ -173,7 +262,7 @@ def build_advice_prompt(state: SessionState) -> str:
 
 
 async def run_advice(ws: WebSocket, state: SessionState):
-    """Run Gemini advice generation loop."""
+    """Run Gemini advice generation loop with TTS."""
     from google.genai import types as genai_types
     
     logger.info("Advice generation loop started")
@@ -202,14 +291,52 @@ async def run_advice(ws: WebSocket, state: SessionState):
                     max_output_tokens=300,
                 ),
             )
+            
+            # Collect full advice text for TTS
+            full_advice_text = ""
+            
             for chunk in stream:
                 if not state.running:
                     break
                 delta = chunk.text or ""
                 if delta:
+                    full_advice_text += delta
                     await ws.send_json({"type": "advice.delta", "text": delta})
+            
             await ws.send_json({"type": "advice.final", "text": ""})
             logger.info("Advice generation completed")
+            
+            # Generate TTS audio if enabled
+            if TTS_ENABLED and full_advice_text.strip():
+                logger.info(f"Generating TTS for advice ({len(full_advice_text)} chars)")
+                
+                # Extract the first sentence (the key advice) for TTS
+                # This keeps the audio short and focused
+                first_sentence = extract_first_sentence(full_advice_text)
+                
+                if first_sentence:
+                    await ws.send_json({"type": "tts.start"})
+                    
+                    # Run TTS generation in thread pool to avoid blocking
+                    audio_data = await asyncio.get_event_loop().run_in_executor(
+                        None, 
+                        lambda: asyncio.run(generate_tts_audio(first_sentence))
+                    )
+                    
+                    if audio_data:
+                        # Send audio as binary WebSocket message
+                        await ws.send_bytes(audio_data)
+                        await ws.send_json({
+                            "type": "tts.complete",
+                            "format": "pcm",
+                            "sample_rate": 24000,
+                            "channels": 1,
+                            "sample_width": 2
+                        })
+                        logger.info(f"TTS audio sent: {len(audio_data)} bytes")
+                    else:
+                        await ws.send_json({"type": "tts.error", "message": "Failed to generate audio"})
+                        
         except Exception as e:
             logger.error(f"Advice error: {str(e)}", exc_info=True)
             await ws.send_json({"type": "error", "message": f"Advice error: {str(e)}"})
