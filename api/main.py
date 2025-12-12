@@ -5,7 +5,7 @@ import time
 import threading
 from collections import deque
 from typing import Deque, Optional
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -91,8 +91,17 @@ def stt_request_generator(state: SessionState, lang: str):
             continue
 
 
-def run_stt_sync(state: SessionState, lang: str, result_queue: Queue):
-    """Run STT in a separate thread (synchronous gRPC)."""
+def run_stt_sync(
+    state: SessionState,
+    lang: str,
+    async_queue: asyncio.Queue,
+    loop: asyncio.AbstractEventLoop,
+):
+    """Run STT in a separate thread (synchronous gRPC).
+    
+    Uses loop.call_soon_threadsafe to safely put results into the asyncio.Queue
+    from this synchronous thread context.
+    """
     try:
         client = get_speech_client()
         requests = stt_request_generator(state, lang)
@@ -106,23 +115,40 @@ def run_stt_sync(state: SessionState, lang: str, result_queue: Queue):
                 if not text:
                     continue
                 if result.is_final:
-                    result_queue.put({"type": "stt.final", "text": text})
+                    loop.call_soon_threadsafe(
+                        async_queue.put_nowait,
+                        {"type": "stt.final", "text": text}
+                    )
                 else:
-                    result_queue.put({"type": "stt.partial", "text": text})
+                    loop.call_soon_threadsafe(
+                        async_queue.put_nowait,
+                        {"type": "stt.partial", "text": text}
+                    )
     except Exception as e:
-        result_queue.put({"type": "error", "message": f"STT error: {str(e)}"})
+        loop.call_soon_threadsafe(
+            async_queue.put_nowait,
+            {"type": "error", "message": f"STT error: {str(e)}"}
+        )
 
 
-async def process_stt_results(ws: WebSocket, state: SessionState, result_queue: Queue):
-    """Process STT results from the thread and send to WebSocket."""
+async def process_stt_results(
+    ws: WebSocket,
+    state: SessionState,
+    result_queue: asyncio.Queue,
+):
+    """Process STT results from the thread and send to WebSocket.
+    
+    Uses asyncio.Queue.get() which properly awaits new items without polling,
+    eliminating unnecessary CPU wake-ups and reducing latency.
+    """
     while state.running:
         try:
-            result = result_queue.get_nowait()
+            result = await asyncio.wait_for(result_queue.get(), timeout=0.5)
             if result["type"] == "stt.final":
                 state.recent_text.append(result["text"])
             await ws.send_json(result)
-        except Empty:
-            await asyncio.sleep(0.05)
+        except asyncio.TimeoutError:
+            continue
         except Exception:
             break
 
@@ -187,7 +213,8 @@ async def health():
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     state = SessionState()
-    stt_result_queue: Queue = Queue()
+    stt_result_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
     
     stt_processor_task = None
     advice_task = None
@@ -200,7 +227,7 @@ async def ws_endpoint(ws: WebSocket):
             if "bytes" in msg and msg["bytes"] is not None:
                 try:
                     state.audio_q.put_nowait(msg["bytes"])
-                except:
+                except Full:
                     pass
                 continue
 
@@ -222,10 +249,11 @@ async def ws_endpoint(ws: WebSocket):
                 if t == "start":
                     lang = data.get("lang", "ja-JP")
                     
-                    # Start STT in a separate thread
+                    # Start STT in a separate thread, passing the asyncio queue and event loop
+                    # for thread-safe communication back to the async context
                     state.stt_thread = threading.Thread(
                         target=run_stt_sync,
-                        args=(state, lang, stt_result_queue),
+                        args=(state, lang, stt_result_queue, loop),
                         daemon=True
                     )
                     state.stt_thread.start()
