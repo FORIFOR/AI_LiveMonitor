@@ -3,6 +3,8 @@ class PcmProcessor extends AudioWorkletProcessor {
     super();
     this._buffer = [];
     this._bufferLen = 0;
+    this._readIndex = 0;
+    this._readOffset = 0;
     this.targetSampleRate = 16000;
   }
 
@@ -29,6 +31,13 @@ class PcmProcessor extends AudioWorkletProcessor {
     return i16;
   }
 
+  compactBuffer() {
+    if (this._readIndex > 10) {
+      this._buffer = this._buffer.slice(this._readIndex);
+      this._readIndex = 0;
+    }
+  }
+
   process(inputs) {
     const input = inputs[0];
     if (!input || !input[0]) return true;
@@ -44,19 +53,27 @@ class PcmProcessor extends AudioWorkletProcessor {
     while (this._bufferLen >= chunkSize) {
       const out = new Int16Array(chunkSize);
       let filled = 0;
+      
       while (filled < chunkSize) {
-        const head = this._buffer[0];
-        const take = Math.min(head.length, chunkSize - filled);
-        out.set(head.subarray(0, take), filled);
+        const head = this._buffer[this._readIndex];
+        const available = head.length - this._readOffset;
+        const take = Math.min(available, chunkSize - filled);
+        
+        out.set(head.subarray(this._readOffset, this._readOffset + take), filled);
         filled += take;
+        this._readOffset += take;
 
-        if (take === head.length) this._buffer.shift();
-        else this._buffer[0] = head.subarray(take);
+        if (this._readOffset >= head.length) {
+          this._readIndex++;
+          this._readOffset = 0;
+        }
       }
+      
       this._bufferLen -= chunkSize;
       this.port.postMessage(out.buffer, [out.buffer]);
     }
 
+    this.compactBuffer();
     return true;
   }
 }

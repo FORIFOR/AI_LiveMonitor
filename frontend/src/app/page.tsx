@@ -11,12 +11,20 @@ type Msg =
   | { type: "started" }
   | { type: "auth.ok" };
 
+interface TranscriptLine {
+  id: string;
+  text: string;
+}
+
+let lineIdCounter = 0;
+const generateLineId = () => `line-${Date.now()}-${++lineIdCounter}`;
+
 export default function Page() {
   const [connected, setConnected] = useState(false);
   const [running, setRunning] = useState(false);
   const [partial, setPartial] = useState("");
-  const [finalLines, setFinalLines] = useState<string[]>([]);
-  const [advice, setAdvice] = useState("");
+  const [finalLines, setFinalLines] = useState<TranscriptLine[]>([]);
+  const [adviceChunks, setAdviceChunks] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -43,11 +51,13 @@ export default function Page() {
         if (msg.type === "stt.partial") setPartial(msg.text);
         if (msg.type === "stt.final") {
           setPartial("");
-          setFinalLines((p) => [...p, msg.text]);
+          setFinalLines((p) => [...p, { id: generateLineId(), text: msg.text }]);
         }
-        if (msg.type === "advice.delta") setAdvice((p) => p + msg.text);
+        if (msg.type === "advice.delta") {
+          setAdviceChunks((p) => [...p, msg.text]);
+        }
         if (msg.type === "advice.final") {
-          setAdvice((p) => p + "\n---\n");
+          setAdviceChunks((p) => [...p, "\n---\n"]);
         }
         if (msg.type === "error") {
           console.error(msg.message);
@@ -133,9 +143,11 @@ export default function Page() {
   const clearTranscript = () => {
     setFinalLines([]);
     setPartial("");
-    setAdvice("");
+    setAdviceChunks([]);
     setError(null);
   };
+
+  const advice = adviceChunks.join("");
 
   useEffect(() => {
     return () => {
@@ -223,9 +235,9 @@ export default function Page() {
                   Start recording to see the transcript...
                 </p>
               )}
-              {finalLines.map((line, i) => (
-                <div key={i} className="mb-2 text-gray-800 dark:text-gray-200">
-                  {line}
+              {finalLines.map((line) => (
+                <div key={line.id} className="mb-2 text-gray-800 dark:text-gray-200">
+                  {line.text}
                 </div>
               ))}
               {partial && (

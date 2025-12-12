@@ -4,8 +4,9 @@ import os
 import time
 import threading
 from collections import deque
+from itertools import islice
 from typing import Deque, Optional
-from queue import Queue, Empty
+from queue import Queue, Empty, Full
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -57,11 +58,13 @@ def get_genai_client():
 class SessionState:
     def __init__(self):
         self.audio_q: Queue = Queue(maxsize=500)
+        self.stt_result_q: asyncio.Queue = asyncio.Queue()
         self.recent_text: Deque[str] = deque(maxlen=30)
         self.running = True
         self.uid: Optional[str] = None
         self.last_advice_at = 0.0
         self.stt_thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 def stt_request_generator(state: SessionState, lang: str):
@@ -91,8 +94,15 @@ def stt_request_generator(state: SessionState, lang: str):
             continue
 
 
-def run_stt_sync(state: SessionState, lang: str, result_queue: Queue):
+def run_stt_sync(state: SessionState, lang: str):
     """Run STT in a separate thread (synchronous gRPC)."""
+    def put_result(result: dict):
+        """Thread-safe way to put result into asyncio queue."""
+        if state._loop and state.running:
+            state._loop.call_soon_threadsafe(
+                state.stt_result_q.put_nowait, result
+            )
+    
     try:
         client = get_speech_client()
         requests = stt_request_generator(state, lang)
@@ -106,30 +116,34 @@ def run_stt_sync(state: SessionState, lang: str, result_queue: Queue):
                 if not text:
                     continue
                 if result.is_final:
-                    result_queue.put({"type": "stt.final", "text": text})
+                    put_result({"type": "stt.final", "text": text})
                 else:
-                    result_queue.put({"type": "stt.partial", "text": text})
+                    put_result({"type": "stt.partial", "text": text})
     except Exception as e:
-        result_queue.put({"type": "error", "message": f"STT error: {str(e)}"})
+        put_result({"type": "error", "message": f"STT error: {str(e)}"})
 
 
-async def process_stt_results(ws: WebSocket, state: SessionState, result_queue: Queue):
-    """Process STT results from the thread and send to WebSocket."""
+async def process_stt_results(ws: WebSocket, state: SessionState):
+    """Process STT results from asyncio queue and send to WebSocket."""
     while state.running:
         try:
-            result = result_queue.get_nowait()
+            result = await asyncio.wait_for(
+                state.stt_result_q.get(), 
+                timeout=0.5
+            )
             if result["type"] == "stt.final":
                 state.recent_text.append(result["text"])
             await ws.send_json(result)
-        except Empty:
-            await asyncio.sleep(0.05)
+        except asyncio.TimeoutError:
+            continue
         except Exception:
             break
 
 
 def build_advice_prompt(state: SessionState) -> str:
     """Build prompt for Gemini advice generation."""
-    recent = "\n".join(list(state.recent_text)[-12:])
+    recent_list = list(state.recent_text)
+    recent = "\n".join(recent_list[-12:] if len(recent_list) > 12 else recent_list)
     return f"""あなたは会議中のリアルタイムアシスタントです。
 以下の会話ログに対して、ユーザーが次に言うべき「1文」を最優先で出してください。
 次に、根拠(箇条書き2〜3)、次に聞く質問(1〜2)を出してください。
@@ -187,7 +201,7 @@ async def health():
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     state = SessionState()
-    stt_result_queue: Queue = Queue()
+    state._loop = asyncio.get_running_loop()
     
     stt_processor_task = None
     advice_task = None
@@ -200,8 +214,8 @@ async def ws_endpoint(ws: WebSocket):
             if "bytes" in msg and msg["bytes"] is not None:
                 try:
                     state.audio_q.put_nowait(msg["bytes"])
-                except:
-                    pass
+                except Full:
+                    pass  # Queue is full, drop the audio chunk
                 continue
 
             # Text (JSON)
@@ -225,14 +239,14 @@ async def ws_endpoint(ws: WebSocket):
                     # Start STT in a separate thread
                     state.stt_thread = threading.Thread(
                         target=run_stt_sync,
-                        args=(state, lang, stt_result_queue),
+                        args=(state, lang),
                         daemon=True
                     )
                     state.stt_thread.start()
                     
                     # Start async tasks for processing results and advice
                     stt_processor_task = asyncio.create_task(
-                        process_stt_results(ws, state, stt_result_queue)
+                        process_stt_results(ws, state)
                     )
                     advice_task = asyncio.create_task(run_advice(ws, state))
                     
@@ -259,8 +273,8 @@ async def ws_endpoint(ws: WebSocket):
         
         try:
             await ws.close()
-        except:
-            pass
+        except (RuntimeError, ConnectionError):
+            pass  # Connection already closed
 
 
 if __name__ == "__main__":
