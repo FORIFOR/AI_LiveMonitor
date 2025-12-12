@@ -67,22 +67,9 @@ class SessionState:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
 
-def stt_request_generator(state: SessionState, lang: str):
-    """Generator for streaming STT requests."""
+def stt_request_generator(state: SessionState):
+    """Generator for streaming STT requests (audio chunks only)."""
     from google.cloud import speech
-    
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code=lang,
-        enable_automatic_punctuation=True,
-    )
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=config,
-        interim_results=True,
-        single_utterance=False,
-    )
-    yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
 
     while state.running:
         try:
@@ -96,6 +83,8 @@ def stt_request_generator(state: SessionState, lang: str):
 
 def run_stt_sync(state: SessionState, lang: str):
     """Run STT in a separate thread (synchronous gRPC)."""
+    from google.cloud import speech
+    
     def put_result(result: dict):
         """Thread-safe way to put result into asyncio queue."""
         if state._loop and state.running:
@@ -105,8 +94,25 @@ def run_stt_sync(state: SessionState, lang: str):
     
     try:
         client = get_speech_client()
-        requests = stt_request_generator(state, lang)
-        responses = client.streaming_recognize(requests=requests)
+        
+        # Build config for streaming recognition
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=16000,
+            language_code=lang,
+            enable_automatic_punctuation=True,
+        )
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=config,
+            interim_results=True,
+            single_utterance=False,
+        )
+        
+        requests = stt_request_generator(state)
+        responses = client.streaming_recognize(
+            config=streaming_config,
+            requests=requests,
+        )
         
         for resp in responses:
             if not state.running:
