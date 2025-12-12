@@ -7,13 +7,14 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.11"
-fastapi = "^0.115.0"
+fastapi = {extras = ["standard"], version = "^0.124.4"}
 uvicorn = {extras = ["standard"], version = "^0.30.6"}
 google-cloud-speech = "^2.27.0"
 google-cloud-firestore = "^2.16.0"
 firebase-admin = "^6.6.0"
 google-genai = "^1.0.0"
 python-dotenv = "^1.0.0"
+google-cloud-aiplatform = "^1.130.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"

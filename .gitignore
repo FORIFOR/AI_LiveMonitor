@@ -10,6 +10,11 @@ venv/
 .env.local
 .env.*.local
 
+# Credentials (NEVER commit these)
+credentials.json
+*.json.key
+*-key.json
+
 # Build outputs
 .next/
 out/
